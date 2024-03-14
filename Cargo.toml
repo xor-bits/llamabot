@@ -1,0 +1,16 @@
+[package]
+name = "llamabot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llm = { git = "https://github.com/rustformers/llm" , branch = "main" }
+rand = "0.8"
+rustyline = "14.0"
+dotenv = "0.15"
+serenity = "0.12"
+tokio = { version = "1.21", features = ["macros", "rt-multi-thread"] }
+once_cell = "1.19"
+
+[profile.dev.package.ggml-sys]
+opt-level = 3
