@@ -1143,6 +1143,7 @@ checksum = "01cda141df6706de531b6c46c3a33ecca755538219bd484262fa09410c13539c"
 name = "llamabot"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "dotenv",
  "llm",
  "once_cell",

@@ -1,6 +1,7 @@
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, fmt, num::NonZeroU16, time::Duration};
 use std::{env, fmt::Write};
 
+use dashmap::DashMap;
 use dotenv::dotenv;
 use llm::{
     conversation_inference_callback, load_progress_callback_stdout, models::Llama,
@@ -9,7 +10,11 @@ use llm::{
 use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use serenity::{
-    all::{GetMessages, Message, Ready},
+    all::{
+        ChannelId, Command, CommandOptionType, CreateCommand, CreateCommandOption,
+        CreateInteractionResponse, CreateInteractionResponseMessage, GetMessages, Integration,
+        Interaction, Message, Ready, ResolvedValue, User,
+    },
     async_trait,
     prelude::*,
 };
@@ -24,7 +29,7 @@ static BOT: Lazy<Llama> = Lazy::new(|| {
         llm::TokenizerSource::Embedded,
         ModelParameters {
             context_size: 8096,
-            // use_gpu: true,
+            use_gpu: true,
             ..<_>::default()
         },
         load_progress_callback_stdout,
@@ -36,20 +41,16 @@ static BOT_PERSONA: OnceCell<String> = OnceCell::new();
 
 //
 
-fn prompt(messages: String) -> String {
-    let (Some(bot_name), Some(persona)) = (BOT_NAME.get(), BOT_PERSONA.get()) else {
-        return String::new();
-    };
-
+fn run_prompt(prompt: String) -> String {
     let mut rng = rand::thread_rng();
     let mut sess = BOT.start_session(<_>::default());
     let mut buf = String::new();
 
-    let prompt = format!(
-        "{persona}\n\nContext:\n\
-            {messages}\
-            {bot_name}:"
-    );
+    // let prompt = format!(
+    //     "{persona}\n\nContext:\n\
+    //         {messages}\
+    //         {bot_name}:"
+    // );
 
     println!("RUNNING `{prompt}`");
     let err = sess.infer::<Infallible>(
@@ -77,55 +78,86 @@ fn prompt(messages: String) -> String {
 
 //
 
-struct Handler;
+struct UserFmt<'a>(&'a User);
+
+impl fmt::Display for UserFmt<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let name = self.0.name.as_str();
+        if let Some(d) = self.0.discriminator {
+            write!(f, "{name}#{d:04}")
+        } else {
+            write!(f, "{name}")
+        }
+    }
+}
+
+//
+
+struct Handler {
+    personas: DashMap<ChannelId, String>,
+    bot: OnceCell<User>,
+}
+
+impl Handler {
+    pub fn new() -> Self {
+        Self {
+            personas: DashMap::new(),
+            bot: OnceCell::new(),
+        }
+    }
+}
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        // let Some(bot) = self.bot.get() else { return };
         if msg.author.bot {
             return;
         }
+
+        let Some(me) = self.bot.get() else {
+            return;
+        };
 
         if !msg.mentions_me(&ctx.http).await.unwrap() && rand::thread_rng().gen_ratio(10, 11) {
             return;
         }
 
-        println!("RUNNING FOR `{}`", msg.content);
-
         let Ok(permit) = TASKS.try_acquire() else {
             return;
         };
 
-        let messages = msg
-            .channel_id
-            .messages(&ctx.http, GetMessages::new().limit(15))
+        let persona = self.personas.get(&msg.channel_id);
+        let persona = persona
+            .as_ref()
+            .map_or(BOT_PERSONA.get().unwrap().as_str(), |s| s.value().as_str());
+
+        println!("RUNNING FOR `{}`", msg.content);
+
+        let mut prompt = String::new();
+
+        writeln!(&mut prompt, "{persona}\n\nContext:").unwrap();
+
+        msg.channel_id
+            .messages(&ctx.http, GetMessages::new().limit(5))
             .await
             .unwrap()
             .into_iter()
             .rev()
-            .fold((String::new(), None), |(mut acc, mut last_user), msg| {
-                let sender = msg.author.name.as_str();
-                let sender = if let Some(d) = msg.author.discriminator {
-                    format!("{sender}#{d:04}")
-                } else {
-                    sender.to_string()
-                };
-
+            .fold(None, |last_user, msg| {
                 let content = msg.content_safe(ctx.cache().unwrap()).replace('@', "");
                 let id = msg.author.id;
                 if last_user == Some(id) {
-                    writeln!(&mut acc, "{content}").unwrap();
+                    // combine subsequent messages from the same user
+                    writeln!(&mut prompt, "{content}").unwrap();
                 } else {
-                    writeln!(&mut acc, "### {sender}:{content}").unwrap();
+                    writeln!(&mut prompt, "### {}: {content}", UserFmt(&msg.author)).unwrap();
                 }
-                last_user = Some(id);
+                Some(id)
+            });
 
-                (acc, last_user)
-            })
-            .0;
+        write!(&mut prompt, "### {}: ", UserFmt(me)).unwrap();
 
-        let res = async { spawn_blocking(move || prompt(messages)).await.unwrap() };
+        let res = async { spawn_blocking(move || run_prompt(prompt)).await.unwrap() };
 
         let heartbeat = || async {
             loop {
@@ -150,9 +182,59 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let Interaction::Command(cmd) = interaction else {
+            return;
+        };
+
+        if let "persona" = cmd.data.name.as_str() {
+            let cmds = cmd.data.options();
+            let response = if let Some(ResolvedValue::String(new)) = cmds.first().map(|v| &v.value)
+            {
+                self.personas.insert(cmd.channel_id, new.to_string());
+                "done".to_string()
+            } else {
+                let persona = self.personas.get(&cmd.channel_id);
+                let persona = persona
+                    .as_ref()
+                    .map_or(BOT_PERSONA.get().unwrap().as_str(), |s| s.as_str());
+                persona.to_string()
+            };
+
+            if let Err(err) = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new().content(response),
+                    ),
+                )
+                .await
+            {
+                eprintln!("cannot respond: {err:?}");
+            }
+        };
+    }
+
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        for guild in ready.guilds.into_iter().filter(|g| g.unavailable) {
+            // println!("guild_id={} unavailable={}", guild.id, guild.unavailable);
+            println!(
+                "registering commands for {:?}",
+                guild.id.name(ctx.cache().unwrap())
+            );
+            _ = guild.id.set_commands(&ctx.http, vec![
+                CreateCommand::new("persona")
+                    .description("Change the bot's persona. Refer to the bot by its name. Example: \"A chat between discord users.\"")
+                    .add_option(CreateCommandOption::new(CommandOptionType::String, "persona", "The new persona"))
+            ]).await;
+        }
+
+        Command::set_global_commands(&ctx.http, vec![])
+            .await
+            .unwrap();
+
         println!("logged in as {}", ready.user.name);
-        BOT_NAME.get_or_init(|| format!("### {}", ready.user.name));
+        self.bot.get_or_init(|| (*ready.user).clone());
     }
 }
 
@@ -175,7 +257,7 @@ async fn main() {
 
     // Create a new instance of the Client, logging in as a bot.
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler)
+        .event_handler(Handler::new())
         .await
         .expect("Err creating client");
 
